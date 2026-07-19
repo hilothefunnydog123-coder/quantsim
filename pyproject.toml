@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quantsim"
-version = "0.2.0"
-description = "Backtest trading strategies on real market data and run Monte Carlo risk simulations — Sharpe, VaR/CVaR, drawdowns, equity curves — in your terminal"
+version = "0.3.0"
+description = "A full quant stack in one package: Monte Carlo simulation, strategy backtesting with order-book execution modeling, a price-time priority matching engine, and live paper trading of the same strategies"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

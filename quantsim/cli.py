@@ -41,9 +41,7 @@ def _run_mc(args: argparse.Namespace) -> None:
     print(f"{DIM}{ascii_histogram(paths[:, -1])}{RESET}\n")
 
 
-def _run_backtest(args: argparse.Namespace) -> None:
-    from quantsim.backtest import run_backtest
-    from quantsim.data import fetch, load_csv
+def _strategy_from_args(args: argparse.Namespace):
     from quantsim.strategies import make_strategy
 
     kwargs = {}
@@ -53,7 +51,23 @@ def _run_backtest(args: argparse.Namespace) -> None:
         kwargs = {"lookback": args.lookback}
     elif args.strategy == "meanrev":
         kwargs = {"window": args.window}
-    strategy = make_strategy(args.strategy, **kwargs)
+    return make_strategy(args.strategy, **kwargs)
+
+
+def _add_strategy_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--strategy", default="sma",
+                        choices=["buyhold", "sma", "momentum", "meanrev"])
+    parser.add_argument("--fast", type=int, default=20, help="sma: fast window")
+    parser.add_argument("--slow", type=int, default=100, help="sma: slow window")
+    parser.add_argument("--lookback", type=int, default=126, help="momentum: lookback bars")
+    parser.add_argument("--window", type=int, default=20, help="meanrev: z-score window")
+
+
+def _run_backtest(args: argparse.Namespace) -> None:
+    from quantsim.backtest import run_backtest
+    from quantsim.data import fetch, load_csv
+
+    strategy = _strategy_from_args(args)
 
     if args.csv:
         series = load_csv(args.csv)
@@ -61,9 +75,16 @@ def _run_backtest(args: argparse.Namespace) -> None:
         print(f"{DIM}fetching {args.symbol} daily history…{RESET}")
         series = fetch(args.symbol, start=args.start)
 
+    execution = None
+    cost_label = f"costs {args.cost_bps:g} bps"
+    if args.execution == "book":
+        from quantsim.execution import BookExecution
+        execution = BookExecution(level_shares=args.level_shares)
+        cost_label = f"costs via order book (level_shares={args.level_shares:g})"
+
     result = run_backtest(
         series.closes, strategy, dates=series.dates,
-        initial=args.initial, cost_bps=args.cost_bps,
+        initial=args.initial, cost_bps=args.cost_bps, execution=execution,
     )
     m = result.metrics
     b = m["benchmark"]
@@ -71,7 +92,7 @@ def _run_backtest(args: argparse.Namespace) -> None:
 
     print(f"\n{BOLD}{CYAN}quantsim backtest{RESET} — {strategy.name} on {label} · "
           f"{len(series):,} bars · {series.dates[0]} → {series.dates[-1]} · "
-          f"costs {args.cost_bps:g} bps\n")
+          f"{cost_label}\n")
     print(f"{BOLD}{'metric':<16}{strategy.name:>14}{'buy & hold':>14}{RESET}")
     rows = [
         ("total return", _pct(m["total_return"]), _pct(b["total_return"])),
@@ -95,10 +116,73 @@ def _run_backtest(args: argparse.Namespace) -> None:
     print()
 
 
+def _live_run(args: argparse.Namespace) -> None:
+    from pathlib import Path
+
+    from quantsim.broker import AlpacaBroker, PaperBroker
+    from quantsim.data import fetch, load_csv
+    from quantsim.live import run_cycle
+
+    strategy = _strategy_from_args(args)
+    if args.csv:
+        series = load_csv(args.csv)
+    else:
+        print(f"{DIM}fetching {args.symbol} daily history…{RESET}")
+        series = fetch(args.symbol)
+
+    if args.live:
+        broker = AlpacaBroker()
+        mode = "alpaca-paper"
+    else:
+        broker = PaperBroker(Path(args.state_dir) / "portfolio.json",
+                             initial_cash=args.initial)
+        mode = "local-sim"
+
+    result = run_cycle(broker, series.closes, args.symbol, strategy,
+                       state_dir=args.state_dir)
+    action = (f"{'BUY' if result.order_qty > 0 else 'SELL'} "
+              f"{abs(result.order_qty):g} {result.symbol}"
+              if result.order_qty else "HOLD (already at target)")
+    print(f"{BOLD}quantsim live{RESET} [{mode}] {result.ts}")
+    print(f"  {result.symbol} @ {result.price:,.2f} · {strategy.name} weight {result.weight:g}")
+    print(f"  position {result.current_qty:g} → target {result.target_qty} · {BOLD}{action}{RESET}")
+    print(f"  equity: {BOLD}{result.equity:,.2f}{RESET}")
+
+
+def _live_status(args: argparse.Namespace) -> None:
+    from quantsim.live import load_history
+
+    history = load_history(args.state_dir)
+    if not history:
+        print("no cycles recorded yet — run `quantsim live run` first")
+        return
+    first, last = history[0], history[-1]
+    total = last["equity"] / first["equity"] - 1.0
+    print(f"{BOLD}quantsim live status{RESET} — {len(history)} cycle(s), "
+          f"{first['ts'][:10]} → {last['ts'][:10]}")
+    print(f"  equity {BOLD}{last['equity']:,.2f}{RESET} ({total * 100:+.2f}% since start)")
+    print(f"  position {last['target_qty']:g} {last['symbol']} · "
+          f"last signal weight {last['weight']:g}")
+    for entry in history[-min(args.tail, len(history)):]:
+        order = (f"{'+' if entry['order_qty'] > 0 else ''}{entry['order_qty']:g}"
+                 if entry["order_qty"] else "·")
+        print(f"  {DIM}{entry['ts'][:16]}  {entry['symbol']} @ {entry['price']:>10,.2f}  "
+              f"w={entry['weight']:g}  order {order:>6}  eq {entry['equity']:>12,.2f}{RESET}")
+
+
+def _live_report(args: argparse.Namespace) -> None:
+    from quantsim.live import load_history
+    from quantsim.report import render_report
+
+    render_report(load_history(args.state_dir), args.out)
+    print(f"report written to {args.out}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="quantsim",
-        description="Monte Carlo simulation and strategy backtesting in your terminal.",
+        description="A full quant stack in your terminal: Monte Carlo simulation, "
+        "strategy backtesting with order-book execution, and live paper trading.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -116,18 +200,44 @@ def main(argv: list[str] | None = None) -> None:
     bt.add_argument("--symbol", default="SPY", help="ticker to fetch (default SPY)")
     bt.add_argument("--csv", help="backtest a local CSV (Date,Close columns) instead")
     bt.add_argument("--start", default="2015-01-01", help="history start date")
-    bt.add_argument("--strategy", default="sma",
-                    choices=["buyhold", "sma", "momentum", "meanrev"])
-    bt.add_argument("--fast", type=int, default=20, help="sma: fast window")
-    bt.add_argument("--slow", type=int, default=100, help="sma: slow window")
-    bt.add_argument("--lookback", type=int, default=126, help="momentum: lookback bars")
-    bt.add_argument("--window", type=int, default=20, help="meanrev: z-score window")
+    _add_strategy_args(bt)
     bt.add_argument("--initial", type=float, default=10_000)
     bt.add_argument("--cost-bps", type=float, default=1.0,
                     help="transaction cost in basis points of turnover")
+    bt.add_argument("--execution", choices=["flat", "book"], default="flat",
+                    help="'book' prices each trade by walking a synthetic "
+                         "limit order book (market impact) instead of flat bps")
+    bt.add_argument("--level-shares", type=float, default=10_000,
+                    help="book execution: liquidity per price level, in shares")
     bt.add_argument("--plot", metavar="PATH.png",
                     help="save an equity/drawdown chart (requires matplotlib)")
     bt.set_defaults(func=_run_backtest)
+
+    live = sub.add_parser(
+        "live", help="paper-trade the same strategies (local sim or Alpaca)"
+    )
+    live_sub = live.add_subparsers(dest="live_command", required=True)
+
+    run_p = live_sub.add_parser("run", help="execute one trading cycle")
+    run_p.add_argument("--symbol", default="SPY")
+    _add_strategy_args(run_p)
+    run_p.add_argument("--csv", help="use a local Date,Close CSV instead of fetching")
+    run_p.add_argument("--live", action="store_true",
+                       help="trade the Alpaca paper account (needs APCA_* env vars)")
+    run_p.add_argument("--state-dir", default="state")
+    run_p.add_argument("--initial", type=float, default=100_000,
+                       help="starting cash for the local simulator")
+    run_p.set_defaults(func=_live_run)
+
+    status_p = live_sub.add_parser("status", help="show position and P&L history")
+    status_p.add_argument("--state-dir", default="state")
+    status_p.add_argument("--tail", type=int, default=10)
+    status_p.set_defaults(func=_live_status)
+
+    report_p = live_sub.add_parser("report", help="render the HTML P&L report")
+    report_p.add_argument("--state-dir", default="state")
+    report_p.add_argument("--out", default="docs/report.html")
+    report_p.set_defaults(func=_live_report)
 
     args = parser.parse_args(argv)
     args.func(args)

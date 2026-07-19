@@ -70,11 +70,17 @@ def run_backtest(
     initial: float = 10_000.0,
     cost_bps: float = 1.0,
     periods_per_year: int = 252,
+    execution=None,
 ) -> BacktestResult:
     """Backtest ``strategy`` over a daily close series.
 
     Transaction costs are charged as ``cost_bps`` basis points on turnover
     (the change in absolute weight), the standard first-order cost model.
+
+    Pass an ``execution`` model (e.g. :class:`quantsim.execution.BookExecution`)
+    to replace the flat fee with order-book mechanics: each rebalance is sized
+    in shares from current equity and executed against synthetic book
+    liquidity, so large or frequent trades pay realistic market impact.
     """
     closes = np.asarray(closes, dtype=float)
     n = len(closes)
@@ -94,9 +100,28 @@ def run_backtest(
         weights[t] = float(np.clip(strategy.target_weight(closes[: t + 1]), -1.0, 1.0))
 
     turnover = np.abs(np.diff(np.concatenate([[0.0], weights])))
-    strat_returns = weights * bar_returns - turnover * (cost_bps / 1e4)
-
-    equity = np.concatenate([[initial], initial * np.cumprod(1.0 + strat_returns)])
+    if execution is None:
+        strat_returns = weights * bar_returns - turnover * (cost_bps / 1e4)
+        equity = np.concatenate([[initial], initial * np.cumprod(1.0 + strat_returns)])
+    else:
+        # Equity-dependent costs: size each rebalance in shares and pay the
+        # slippage of walking the synthetic book with that order.
+        strat_returns = np.empty(n - 1)
+        equity_t = initial
+        equity = np.empty(n)
+        equity[0] = initial
+        for t in range(n - 1):
+            cost_frac = 0.0
+            if turnover[t] > 0:
+                shares = turnover[t] * equity_t / closes[t]
+                cost_frac = (
+                    turnover[t]
+                    * execution.slippage_bps(shares, mid=float(closes[t]))
+                    / 1e4
+                )
+            strat_returns[t] = weights[t] * bar_returns[t] - cost_frac
+            equity_t *= 1.0 + strat_returns[t]
+            equity[t + 1] = equity_t
     benchmark = initial * closes / closes[0]
 
     active = weights != 0

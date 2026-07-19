@@ -1,0 +1,54 @@
+# Runs one live paper-trading cycle every US market morning and commits the
+# updated state + P&L report back to the repo. Free scheduling via Actions.
+#
+# Setup (one time):
+#   1. (Optional) Free paper keys at https://app.alpaca.markets ->
+#      repo Settings -> Secrets -> Actions: APCA_API_KEY_ID, APCA_API_SECRET_KEY.
+#      Without secrets the bot runs the local simulator — still an honest,
+#      auditable track record.
+#   2. Enable GitHub Pages (main branch, /docs) to publish the live report.
+name: daily-trade
+
+on:
+  schedule:
+    - cron: "40 14 * * 1-5" # ~10:40 ET during DST, ~09:40 ET in winter
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install quantsim
+        run: pip install .
+
+      - name: Run trading cycle
+        env:
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+        run: |
+          if [ -n "$APCA_API_KEY_ID" ]; then
+            quantsim live run --symbol SPY --strategy sma --live
+          else
+            echo "No Alpaca secrets configured — running local simulation."
+            quantsim live run --symbol SPY --strategy sma
+          fi
+
+      - name: Render report
+        run: quantsim live report --out docs/report.html
+
+      - name: Commit state and report
+        run: |
+          git config user.name "quantsim-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state docs/report.html
+          git diff --cached --quiet || git commit -m "live: cycle $(date -u +%Y-%m-%d)"
+          git push
